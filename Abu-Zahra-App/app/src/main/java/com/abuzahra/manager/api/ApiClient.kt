@@ -214,6 +214,24 @@ object ApiClient {
         }
     }
 
+    // ===== SEND EVENT =====
+    suspend fun sendEvent(deviceId: String, eventType: String, data: Map<String, Any?>) {
+        withContext(Dispatchers.IO) {
+            try {
+                val body = mapOf(
+                    "device_id" to deviceId,
+                    "event_type" to eventType,
+                    "data" to data,
+                    "timestamp" to System.currentTimeMillis()
+                )
+                val response = post("/event", body)
+                Log.d(TAG, "sendEvent [$eventType] response: '${response.take(200)}'")
+            } catch (e: Exception) {
+                Log.e(TAG, "sendEvent error for $eventType", e)
+            }
+        }
+    }
+
     // ===== HEARTBEAT =====
     suspend fun sendHeartbeat(context: Context, battery: Int, status: String = "online") {
         withContext(Dispatchers.IO) {

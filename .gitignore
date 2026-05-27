@@ -1,0 +1,39 @@
+# Virtual environments
+venv/
+.venv/
+deploy_venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.local
+
+# Build artifacts
+*.apk
+!releases/*.apk
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Skills (not needed in repo)
+skills/
